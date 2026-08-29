@@ -33,7 +33,8 @@ import { classifyUpstreamStatus, classifyNetworkError, classifyTimeout } from '.
  *   { ok: false, classification }           -> failure (caller decides retry)
  */
 export async function makeUpstreamRequest({
-  provider, keyEntry, body, endpoint, requestId, clientSignal, timeoutMs, expectStream
+  provider, keyEntry, body, endpoint, requestId, clientSignal, timeoutMs, expectStream,
+  headers = null
 }) {
   const timeoutCtrl = new AbortController();
   const timer = setTimeout(() => timeoutCtrl.abort(), timeoutMs);
@@ -48,7 +49,9 @@ export async function makeUpstreamRequest({
   try {
     const response = await fetch(endpoint, {
       method: 'POST',
-      headers: provider.buildHeaders(keyEntry.key),
+      // Headers come from the provider adapter (per-API auth shape). The proxy
+      // never forwards inbound client authentication.
+      headers: headers || provider.buildHeaders(keyEntry.key),
       body: JSON.stringify(body),
       signal
     });

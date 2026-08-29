@@ -39,7 +39,15 @@ export function createMock(opts = {}) {
     chunkGapMs = 0,
     acceptKeys = null,
     /** '/v1/responses' behavior: 'native-json' | 'native-stream' | 'echo-requests-object' */
-    responsesBehavior = null
+    responsesBehavior = null,
+    /** Anthropic /v1/messages behavior:
+     *  'message' (non-streaming Message), 'messages-stream' (SSE),
+     *  'echo' (wrap request in a Message / native SSE events) */
+    anthropicBehavior = null,
+    /** Anthropic SSE events: [type, payload][] for 'messages-stream'. */
+    anthropicEvents = null,
+    /** Response body for /v1/messages/count_tokens (default {input_tokens:42}). */
+    anthropicCountBody = null
   } = opts;
 
   const requests = []; // { key, body, headers, time, path }
@@ -78,6 +86,30 @@ export function createMock(opts = {}) {
     error: null
   };
 
+  const defaultAnthropicMessage = {
+    id: 'msg_mock',
+    type: 'message',
+    role: 'assistant',
+    model: 'claude-3-5-sonnet-20241022',
+    content: [{ type: 'text', text: 'Hello from Anthropic mock' }],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: 12, output_tokens: 7 }
+  };
+
+  const defaultAnthropicEvents = [
+    ['message_start', { type: 'message_start', message: { id: 'msg_mock', type: 'message', role: 'assistant',
+      model: 'claude-3-5-sonnet-20241022', content: [], stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 12, output_tokens: 0 } } }],
+    ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello' } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: ' native' } }],
+    ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+    ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 7 } }],
+    ['message_stop', { type: 'message_stop' }]
+  ];
+
   const defaultJson = {
     id: 'chatcmpl-mock',
     object: 'chat.completion',
@@ -94,12 +126,14 @@ export function createMock(opts = {}) {
     req.on('end', () => {
       let parsed = null;
       try { parsed = JSON.parse(reqBody); } catch {}
-      requests.push({ key: auth, body: parsed, headers: { ...req.headers }, time: Date.now(),
-        url: req.url, path: req.url?.split('?')[0] });
+      const xapiKey = req.headers['x-api-key'] || '';
+      requests.push({ key: auth || xapiKey, bearer: auth, xApiKey: xapiKey, body: parsed,
+        headers: { ...req.headers }, time: Date.now(), url: req.url, path: req.url?.split('?')[0] });
 
-      // Key gating (for auth rotation tests).
+      // Key gating (for auth rotation tests). Accepts Bearer tokens and
+      // Anthropic-style x-api-key headers.
       if (acceptKeys) {
-        const token = auth.replace(/^Bearer /, '');
+        const token = auth.replace(/^Bearer /, '') || xapiKey;
         if (!acceptKeys.includes(token)) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'Invalid authentication key', type: 'invalid_request_error' } }));
@@ -109,6 +143,59 @@ export function createMock(opts = {}) {
 
       const respond = () => {
         const wantsStream = parsed?.stream === true;
+
+        // Anthropic native endpoint behavior: the mock serves whatever the
+        // proxy sends to /v1/messages (or /v1/messages/count_tokens) according
+        // to anthropicBehavior. Honors delayMs (slow upstream tests).
+        if (anthropicBehavior && (req.url || '').includes('/v1/messages')) {
+          const respondAnthropic = () => {
+            const sendAnthropicSse = (events) => {
+              res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+              let ei = 0;
+              const send = () => {
+                if (ei >= events.length) { res.end(); return; }
+                const [type, payload] = events[ei++];
+                res.write(`event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`);
+                if (chunkGapMs > 0) setTimeout(send, chunkGapMs);
+                else setImmediate(send);
+              };
+              send();
+            };
+            if ((req.url || '').includes('/count_tokens')) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(anthropicCountBody ?? { input_tokens: 42 }));
+              return;
+            }
+            if (anthropicBehavior === 'message') {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(body ?? defaultAnthropicMessage));
+              return;
+          }
+            if (anthropicBehavior === 'messages-stream') {
+              sendAnthropicSse(anthropicEvents ?? defaultAnthropicEvents);
+              return;
+            }
+            if (anthropicBehavior === 'echo') {
+              // Streaming: replay default native events; non-streaming: a
+              // valid Message echoing nothing (request introspection is
+              // done via getRequests()).
+              if (parsed?.stream === true) {
+                sendAnthropicSse(defaultAnthropicEvents);
+                return;
+              }
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ...defaultAnthropicMessage, stop_reason: 'end_turn' }));
+              return;
+            }
+          };
+          // Honor delayMs for slow-upstream tests (parallel to chat behavior).
+          if (delayMs > 0 && behavior === 'slow') {
+            setTimeout(respondAnthropic, delayMs);
+            return;
+          }
+          respondAnthropic();
+          return;
+        }
 
         // Native Responses endpoint behavior: the mock serves whatever the
         // proxy sends to /v1/responses according to responsesBehavior.

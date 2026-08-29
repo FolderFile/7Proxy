@@ -20,11 +20,12 @@ import { logger } from './logger.js';
 import { Errors, classifyNetworkError } from './errors.js';
 import { KeyManager } from './key-manager.js';
 import { makeUpstreamRequest } from './upstream.js';
-import { streamResponse } from './streaming.js';
-import { streamResponses } from '../formats/responses-stream.js';
-import { translateResponsesRequest, UnsupportedFieldError } from '../formats/responses-request.js';
-import { validateNativeResponsesBody, validateNativeResponsesObject } from '../formats/responses-native.js';
-import { translateChatResponseToResponses, ChatToResponsesStreamTranslator } from '../formats/responses-translate.js';
+import { sendError, sendJson, readBody, sseHead } from './http-utils.js';
+import { createChatCompletionsHandler } from '../api/chat-completions.js';
+import { createResponsesHandler } from '../api/responses.js';
+import { createAnthropicHandlers } from '../api/anthropic-messages.js';
+import { UnsupportedFieldError } from '../formats/unsupported-field.js';
+import { anthropicErrorFromOpenAI } from '../formats/anthropic-errors.js';
 
 const SAFE_METHODS = new Set(['GET', 'POST', 'OPTIONS']);
 
@@ -51,68 +52,6 @@ function bearerToken(req) {
   return '';
 }
 
-/** Send a JSON error body (OpenAI-compatible: only {error:{...}}). */
-function sendError(res, statusCode, err, extraHeaders = {}) {
-  if (res.headersSent || res.writableEnded) return;
-  res.writeHead(statusCode, {
-    'Content-Type': 'application/json',
-    ...extraHeaders
-  });
-  res.end(JSON.stringify({ error: err.error }));
-}
-
-/** Send a JSON success body. */
-function sendJson(res, statusCode, data, extraHeaders = {}) {
-  if (res.headersSent || res.writableEnded) return;
-  res.writeHead(statusCode, { 'Content-Type': 'application/json', ...extraHeaders });
-  res.end(JSON.stringify(data));
-}
-
-/** Read request body with streaming size limit (rejects while reading). */
-function readBody(req, maxSize) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    let rejected = false;
-    const onAbort = () => { if (!rejected) reject(new Error('aborted')); cleanup(); };
-    function cleanup() {
-      req.removeListener('data', onData);
-      req.removeListener('end', onEnd);
-      req.removeListener('error', onError);
-      req.removeListener('aborted', onAbort);
-    }
-    function onData(chunk) {
-      if (rejected) return;
-      size += chunk.length;
-      if (size > maxSize) {
-        rejected = true;
-        cleanup();
-        // Drain remaining data without buffering, then reject.
-        req.on('data', () => {});
-        reject(Errors.bodyTooLarge());
-        return;
-      }
-      chunks.push(chunk);
-    }
-    function onEnd() {
-      if (rejected) return;
-      cleanup();
-      const body = Buffer.concat(chunks).toString('utf-8');
-      if (!body) { resolve({}); return; }
-      try { resolve(JSON.parse(body)); }
-      catch { reject(Errors.invalidRequest('Invalid JSON in request body')); }
-    }
-    function onError(err) {
-      if (rejected) return;
-      rejected = true; cleanup(); reject(err);
-    }
-    req.on('data', onData);
-    req.on('end', onEnd);
-    req.on('error', onError);
-    req.on('aborted', onAbort);
-  });
-}
-
 /** Abortable, jittered exponential backoff. Resolves true after delay, false if aborted. */
 function backoff(delayMs, signal) {
   return new Promise((resolve) => {
@@ -128,17 +67,6 @@ function jitteredDelay(attempt, base, max) {
   const exp = Math.min(max, base * Math.pow(2, attempt));
   // full jitter
   return Math.floor(Math.random() * exp);
-}
-
-/** SSE response headers shared by all streaming APIs. */
-function sseHead(res, rid) {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no',
-    'X-Request-Id': rid
-  });
 }
 
 export function createRouter(config, registry) {
@@ -169,7 +97,8 @@ export function createRouter(config, registry) {
 
   function validateProxyAuth(req) {
     if (!config.proxyApiKey) return true;
-    const token = bearerToken(req);
+    // Bearer token or Anthropic-style x-api-key (constant-time compared).
+    const token = bearerToken(req) || req.headers['x-api-key'] || '';
     if (!token) return false;
     return timingSafeEqual(token, config.proxyApiKey);
   }
@@ -220,6 +149,35 @@ export function createRouter(config, registry) {
   }
 
   /**
+   * Error-shape adapter: OpenAI endpoints keep OpenAI-shaped errors; Anthropic
+   * endpoints receive Anthropic-shaped errors with identical sanitized status
+   * semantics (lazy import avoided: handler modules register their mapper).
+   */
+  const errorMappers = {
+    chat: (res, err, rid, statusCode) =>
+      sendError(res, statusCode ?? err.statusCode ?? 502, err, { 'X-Request-Id': rid }),
+    responses: (res, err, rid, statusCode) =>
+      sendError(res, statusCode ?? err.statusCode ?? 502, err, { 'X-Request-Id': rid }),
+    'anthropic-messages': (res, err, rid, statusCode) => {
+      const ae = anthropicErrorFromOpenAI(err, rid);
+      sendAnthropicShaped(res, statusCode ?? ae.statusCode, ae, rid);
+    },
+    'anthropic-token-count': (res, err, rid, statusCode) => {
+      const ae = anthropicErrorFromOpenAI(err, rid);
+      sendAnthropicShaped(res, statusCode ?? ae.statusCode, ae, rid);
+    }
+  };
+  function sendAnthropicShaped(res, statusCode, anthropicErrEnvelope, rid) {
+    if (res.headersSent || res.writableEnded) return;
+    res.writeHead(statusCode, { 'Content-Type': 'application/json', 'X-Request-Id': rid });
+    res.end(JSON.stringify(anthropicErrEnvelope.error));
+  }
+  function errorMapperFor(api) {
+    return errorMappers[api] || ((res, err, rid, statusCode) =>
+      sendError(res, statusCode ?? err.statusCode ?? 502, err, { 'X-Request-Id': rid }));
+  }
+
+  /**
    * Shared attempt/failover loop used by every API surface.
    *
    * @param {object} args
@@ -231,7 +189,8 @@ export function createRouter(config, registry) {
    *        pre-commit validation of a successful upstream result.
    * @param {Function} args.commit - async ({ result, provider, clientCtrl, res, rid, upstreamBody }) => void
    */
-  async function runWithFailover({ req, res, rid, api, body, prepareBody, validateResult, commit }) {
+  async function runWithFailover({ req, res, rid, api, body, prepareBody, validateResult, commit,
+      headerPolicy, anthropicVersion }) {
     const startTime = Date.now();
     // Client disconnect controller: shared with the commit phase.
     const clientCtrl = new AbortController();
@@ -278,22 +237,56 @@ export function createRouter(config, registry) {
 
         let result;
         try {
-          // Translated Responses requests execute against the provider's chat
-          // endpoint; native Responses requests go to /v1/responses.
-          const endpoint = api === 'chat'
-            ? provider.getChatEndpoint()
-            : (provider.capabilities.responses === 'native'
+          // Endpoint selection per API and provider mode:
+          //  - chat                     -> /v1/chat/completions
+          //  - responses (native)       -> /v1/responses (else chat endpoint)
+          //  - anthropic-messages       -> provider Messages endpoint
+          //                                (native) or chat endpoint (translated)
+          //  - anthropic-token-count    -> provider count_tokens endpoint
+          let endpoint;
+          let expectStream;
+          if (api === 'chat') {
+            endpoint = provider.getChatEndpoint();
+            expectStream = upstreamBody.stream === true;
+          } else if (api === 'responses') {
+            endpoint = provider.capabilities.responses === 'native'
               ? provider.getResponsesEndpoint()
-              : provider.getChatEndpoint());
+              : provider.getChatEndpoint();
+            expectStream = upstreamBody.stream === true;
+          } else if (api === 'anthropic-messages') {
+            endpoint = provider.capabilities.anthropicMessages === 'native'
+              ? provider.getMessagesEndpoint()
+              : provider.getChatEndpoint();
+            expectStream = upstreamBody.stream === true;
+          } else if (api === 'anthropic-token-count') {
+            endpoint = provider.getCountTokensEndpoint();
+            expectStream = false;
+          } else {
+            endpoint = provider.getChatEndpoint();
+            expectStream = upstreamBody.stream === true;
+          }
+
+          // Per-API upstream headers. Anthropic-native calls authenticate via
+          // x-api-key + anthropic-version; everything else uses Bearer. The
+          // headerPolicy hook (set by the Anthropic edge) constructs these
+          // from the provider key ONLY - the inbound proxy key never travels.
+          const extraHeaders = headerPolicy
+            ? headerPolicy(provider, keyEntry.key, anthropicVersion)
+            : {};
+          const upstreamHeaders = api === 'anthropic-messages' || api === 'anthropic-token-count'
+            ? provider.buildHeaders(keyEntry.key, api, extraHeaders)
+            : provider.buildHeaders(keyEntry.key);
+
           result = await makeUpstreamRequest({
             provider,
             keyEntry,
             body: upstreamBody,
             endpoint,
+            headers: upstreamHeaders,
             requestId: rid,
             clientSignal: clientCtrl.signal,
             timeoutMs: upstreamBody.stream === true ? config.streamTimeoutMs : config.requestTimeoutMs,
-            expectStream: upstreamBody.stream === true
+            expectStream
           });
         } catch (err) {
           // Should not happen (errors are caught inside), but be safe.
@@ -337,8 +330,11 @@ export function createRouter(config, registry) {
           keyAction: c?.keyAction, retry: c?.retry });
 
         if (c && c.retry === false) {
-          // Terminal client-side error from upstream (e.g. 400/404): forward it.
-          if (c.error) sendError(res, c.error.statusCode, c.error, { 'X-Request-Id': rid });
+          // Terminal client-side error from upstream (e.g. 400/404): forward it
+          // in the API's native error shape (OpenAI vs Anthropic).
+          if (c.error) {
+            errorMapperFor(api)(res, c.error, rid, c.error.statusCode);
+          }
           committed = true;
           break;
         }
@@ -356,15 +352,16 @@ export function createRouter(config, registry) {
       if (!committed && !res.headersSent) {
         logger.error('All upstream attempts failed', { requestId: rid,
           attempts, durationMs: Date.now() - startTime });
+        const errorMapper = errorMapperFor(api);
         if (firstUnsupported) {
           // No capable provider could represent the request: explicit 400,
           // never a partially degraded forward. Include the identifying detail.
           const err = Errors.unsupportedParameter(firstUnsupported.param);
           const detail = firstUnsupported.reason ?? '';
           if (detail) err.error.message = `Parameter '${firstUnsupported.param}': ${detail}`;
-          sendError(res, 400, err, { 'X-Request-Id': rid });
+          errorMapper(res, err, rid);
         } else {
-          sendError(res, 502, Errors.upstreamFailed(), { 'X-Request-Id': rid });
+          errorMapper(res, Errors.upstreamFailed(), rid);
         }
       }
     } finally {
@@ -372,206 +369,18 @@ export function createRouter(config, registry) {
     }
   }
 
-  /** ---------------- Chat Completions (unchanged behavior) ---------------- */
-
-  async function handleChatCompletions(req, res, rid) {
-    // Content-Type validation for POST with a body.
-    const ct = req.headers['content-type'] || '';
-    if (!ct.includes('application/json')) {
-      sendError(res, 415, Errors.invalidRequest('Content-Type must be application/json'), { 'X-Request-Id': rid });
-      return;
-    }
-
-    let body;
-    try {
-      body = await readBody(req, config.maxRequestBodySize);
-    } catch (e) {
-      if (e?.error) {
-        sendError(res, e.statusCode, e, { 'X-Request-Id': rid });
-      } else if (e?.message === 'aborted') {
-        return; // client gone
-      } else {
-        sendError(res, 500, Errors.internal(), { 'X-Request-Id': rid });
-      }
-      return;
-    }
-
-    const model = body.model;
-    if (!model || typeof model !== 'string') {
-      sendError(res, 400, Errors.invalidRequest('you must provide a model parameter'), { 'X-Request-Id': rid });
-      return;
-    }
-
-    if (!registry.getByModel(model)) {
-      sendError(res, 404, Errors.notFound(`Model '${model}'`), { 'X-Request-Id': rid });
-      return;
-    }
-
-    logger.info('Chat request', { requestId: rid, model, provider: registry.getByModel(model).name,
-      stream: body.stream === true });
-
-    await runWithFailover({
-      req, res, rid,
-      api: 'chat',
-      body,
-      // OpenAI-compatible pass-through: forward the client body unchanged.
-      prepareBody: (provider) => body,
-      validateResult: null,
-      commit: async ({ result, provider, clientCtrl, res, rid }) => {
-        if (result.kind === 'json') {
-          sendJson(res, 200, result.body, { 'X-Request-Id': rid });
-        } else if (result.kind === 'stream-json') {
-          // Upstream ignored stream flag; wrap JSON as one SSE event + [DONE].
-          sseHead(res, rid);
-          const ok = res.write(`data: ${JSON.stringify(result.json)}\n\n`);
-          if (!ok) await new Promise(r => res.once('drain', r));
-          res.write('data: [DONE]\n\n');
-          res.end();
-        } else {
-          sseHead(res, rid);
-          await streamResponse(
-            result.response.body,
-            res,
-            { requestId: rid, provider: provider.name },
-            clientCtrl.signal,
-            config.streamTimeoutMs,
-            config.streamOverallTimeoutMs
-          );
-        }
-      }
-    });
-  }
-
-  /** ---------------- Responses API ---------------- */
-
-  async function handleResponses(req, res, rid) {
-    // Content-Type validation for POST with a body.
-    const ct = req.headers['content-type'] || '';
-    if (!ct.includes('application/json')) {
-      sendError(res, 415, Errors.invalidRequest('Content-Type must be application/json'), { 'X-Request-Id': rid });
-      return;
-    }
-
-    let body;
-    try {
-      body = await readBody(req, config.maxRequestBodySize);
-    } catch (e) {
-      if (e?.error) {
-        sendError(res, e.statusCode, e, { 'X-Request-Id': rid });
-      } else if (e?.message === 'aborted') {
-        return; // client gone
-      } else {
-        sendError(res, 500, Errors.internal(), { 'X-Request-Id': rid });
-      }
-      return;
-    }
-
-    const model = body.model;
-    if (!model || typeof model !== 'string') {
-      sendError(res, 400, Errors.invalidRequest('you must provide a model parameter'), { 'X-Request-Id': rid });
-      return;
-    }
-
-    if (!registry.getByModel(model)) {
-      sendError(res, 404, Errors.notFound(`Model '${model}'`), { 'X-Request-Id': rid });
-      return;
-    }
-
-    const wantsStream = body.stream === true;
-
-    // Capability pre-flight: if NO provider can serve Responses for this body
-    // (including field-level constraints), reject before any upstream call.
-    const capable = registry.getCapableFailoverProviders(model, 'responses', body);
-    if (capable.length === 0) {
-      sendError(res, 400, Errors.unsupportedEndpoint('Responses', model), { 'X-Request-Id': rid });
-      return;
-    }
-
-    logger.info('Responses request', { requestId: rid, model,
-      provider: registry.getByModel(model).name, stream: wantsStream });
-
-    await runWithFailover({
-      req, res, rid,
-      api: 'responses',
-      body,
-      // API edge: per-provider request preparation.
-      //  - native:      body validated & forwarded as-is (endpoint /v1/responses)
-      //  - translated:  Responses -> Chat Completions translation
-      prepareBody: (provider) => {
-        const mode = provider.capabilities.responses;
-        if (mode === 'native') {
-          // Native: forward as-is. Capability gating for power fields.
-          validateNativeResponsesBody(body, provider.capabilities);
-          return body;
-        }
-        return translateResponsesRequest(body, provider.capabilities);
-      },
-      validateResult: (result, provider) => {
-        if (provider.capabilities.responses === 'native') {
-          return result.kind === 'json' ? validateNativeResponsesObject(result.body) : null;
-        }
-        // Translated: chat JSON must have a choices array (if not, fail over).
-        if (result.kind === 'json') {
-          const b = result.body;
-          if (!b || typeof b !== 'object' || !Array.isArray(b.choices)) {
-            return { error: Errors.upstreamFailed({ reason: 'malformed chat completions object' }),
-              retry: true, keyAction: 'none' };
-          }
-        }
-        return null;
-      },
-      commit: async ({ result, provider, clientCtrl, res, rid, upstreamBody }) => {
-        const mode = provider.capabilities.responses;
-
-        if (result.kind === 'json') {
-          if (mode === 'native') {
-            // Preserve the native Responses object.
-            sendJson(res, 200, result.body, { 'X-Request-Id': rid });
-          } else {
-            // Translate chat completion -> Responses object.
-            sendJson(res, 200, translateChatResponseToResponses(result.body, upstreamBody),
-              { 'X-Request-Id': rid });
-          }
-          return;
-        }
-
-        // Streaming.
-        sseHead(res, rid);
-
-        if (result.kind === 'stream-json') {
-          // Upstream ignored the stream flag.
-          if (mode === 'native') {
-            const ok = res.write(`data: ${JSON.stringify(result.json)}\n\n`);
-            if (!ok) await new Promise(r => res.once('drain', r));
-          } else {
-            const translator = new ChatToResponsesStreamTranslator(upstreamBody);
-            for (const e of translator.initialEvents()) res.write(e);
-            for (const e of translator.onChatChunk(result.json)) res.write(e);
-            for (const e of translator.finalEvents()) {
-              const ok = res.write(e);
-              if (!ok) await new Promise(r => res.once('drain', r));
-            }
-          }
-          res.end();
-          return;
-        }
-
-        // SSE stream.
-        await streamResponses(
-          result.response.body,
-          res,
-          { requestId: rid, provider: provider.name, mode: mode === 'native' ? 'native' : 'translated' },
-          clientCtrl.signal,
-          {
-            inactivityTimeoutMs: config.streamTimeoutMs,
-            overallTimeoutMs: config.streamOverallTimeoutMs,
-            mode: mode === 'native' ? 'native' : 'translated',
-            requestBody: upstreamBody
-          }
-        );
-      }
-    });
-  }
+  // API handlers live in src/api/* (protocol edges). They receive a shared
+  // context: config, registry, runWithFailover, sseHead, timing helper.
+  const apiCtx = {
+    config, registry, runWithFailover,
+    sseHead,
+    now: () => Date.now(),
+    /** API edges register Anthropic-shaped error mappers here. */
+    registerErrorMapper(api, fn) { errorMappers[api] = fn; }
+  };
+  const { handleChatCompletions } = createChatCompletionsHandler(apiCtx);
+  const { handleResponses } = createResponsesHandler(apiCtx);
+  const anthropic = createAnthropicHandlers(apiCtx);
 
   return async function handleRequest(req, res) {
     const rid = generateRequestId();
@@ -579,13 +388,20 @@ export function createRouter(config, registry) {
 
     if (handleCorsPreflight(req, res)) return;
 
+    const path = req.url || '/';
+    const method = req.method;
+
     if (!validateProxyAuth(req)) {
+      // Anthropic endpoints return Anthropic-shaped auth errors.
+      if (path.startsWith('/v1/messages')) {
+        const ae = anthropicErrorFromOpenAI(Errors.proxyAuthRequired(), rid);
+        res.writeHead(401, { 'Content-Type': 'application/json', 'X-Request-Id': rid });
+        res.end(JSON.stringify(ae.error));
+        return;
+      }
       sendError(res, 401, Errors.proxyAuthRequired(), { 'X-Request-Id': rid });
       return;
     }
-
-    const path = req.url || '/';
-    const method = req.method;
 
     try {
       if (path === '/health' && method === 'GET') {
@@ -598,6 +414,10 @@ export function createRouter(config, registry) {
         await handleChatCompletions(req, res, rid);
       } else if (path === '/v1/responses' && method === 'POST') {
         await handleResponses(req, res, rid);
+      } else if (path === '/v1/messages' && method === 'POST') {
+        await anthropic.handleMessagesCreate(req, res, rid);
+      } else if (path === '/v1/messages/count_tokens' && method === 'POST') {
+        await anthropic.handleCountTokens(req, res, rid);
       } else if (!SAFE_METHODS.has(method)) {
         sendError(res, 405, Errors.methodNotAllowed(), { 'X-Request-Id': rid, Allow: 'GET, POST, OPTIONS' });
       } else {

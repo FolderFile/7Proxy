@@ -1,13 +1,13 @@
 {
   "name": "seven-proxy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "7Proxy - production-ready lightweight OpenAI-compatible AI proxy (Chat Completions + Responses APIs)",
   "main": "src/app.js",
   "type": "module",
   "scripts": {
     "start": "node src/app.js",
     "dev": "node --watch src/app.js",
-    "test": "node test/integration/chat-completions.test.js && node test/integration/responses.test.js"
+    "test": "node test/integration/chat-completions.test.js && node test/integration/responses.test.js && node test/integration/anthropic-messages.test.js"
   },
   "engines": {
     "node": ">=18.0.0"

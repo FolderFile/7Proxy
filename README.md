@@ -241,6 +241,119 @@ const response = await client.responses.create({
 });
 ```
 
+## Anthropic Messages API
+
+`POST /v1/messages` and `POST /v1/messages/count_tokens` implement the
+Anthropic-compatible Messages API with two provider modes:
+
+- **native** — the upstream speaks Anthropic's Messages protocol. Requests are
+  forwarded verbatim to the provider's Messages endpoint (default
+  `/v1/messages`, overridable per provider), content blocks (text, image,
+  tool_use, tool_result, thinking) are preserved, native SSE events relay with
+  minimal buffering, and unknown future event types pass through untouched.
+- **translated** — the upstream only speaks Chat Completions. Messages are
+  translated (system→system message, images→image_url parts, tool_use→
+  tool_calls, tool_result→tool messages, `max_tokens` direct, stop_sequences→
+  stop, tool_choice mapped) and responses/events are translated back into the
+  Anthropic shape with generated `msg_`/`toolu_` ids.
+- **unsupported** — the provider is skipped for these endpoints.
+
+### Authentication
+
+Anthropic clients authenticate with `x-api-key`; OpenAI clients with
+`Authorization: Bearer`. Both are accepted against the optional proxy key
+(constant-time comparison). The proxy **never forwards inbound credentials**:
+upstream authentication is constructed per provider (Bearer for OpenAI-shaped,
+`x-api-key` + `anthropic-version` for anthropic-native).
+
+`anthropic-version` must be a date string (`YYYY-MM-DD`); a safe default
+(`2023-06-01`) is applied when absent. `anthropic-beta` is forwarded only to
+native providers that declare the `betas` capability. No other inbound headers
+are copied upstream.
+
+### Capabilities
+
+```env
+# anthropicMessages=native|translated   (default unsupported)
+# anthropicTokenCount=native            (counting is native-only, never estimated)
+# thinking / documents / betas          (native-only feature gates)
+# anthropicVersion=YYYY-MM-DD           (anthropic-native providers)
+# messagesPath / countTokensPath        (endpoint overrides)
+ANTHROPIC_CAPABILITIES=anthropicMessages=native,anthropicTokenCount=native,thinking=true
+OPENAI_CAPABILITIES=anthropicMessages=translated
+```
+
+A request carrying a field a provider cannot preserve (e.g. `thinking` in
+translated mode) routes to a capable provider without consuming an upstream
+attempt; if none exists, an Anthropic-shaped 400 names the field. Nothing is
+ever silently dropped.
+
+### Tool use example
+
+```bash
+curl -s -X POST http://localhost:8080/v1/messages \
+  -H "content-type: application/json" -H "x-api-key: your-proxy-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4",
+    "max_tokens": 1024,
+    "system": "Be brief.",
+    "tools": [{"name": "get_weather", "description": "Get weather",
+      "input_schema": {"type": "object", "properties": {"loc": {"type": "string"}}}}],
+    "messages": [{"role": "user", "content": "Weather in Paris?"}]
+  }'
+```
+
+Tool calls produce `stop_reason: "tool_use"` with preserved tool ids; results
+round-trip via `tool_use`/`tool_result` blocks (native) or tool-call messages
+(translated).
+
+### Streaming example
+
+```bash
+curl -sN -X POST http://localhost:8080/v1/messages \
+  -H "content-type: application/json" -H "x-api-key: your-proxy-key" \
+  -d '{"model":"claude-sonnet-4","max_tokens":256,"stream":true,
+       "messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+Event lifecycle (both modes): `message_start` → `content_block_start` →
+`content_block_delta*` (text_delta / input_json_delta / thinking_delta) →
+`content_block_stop` → … → `message_delta` (stop_reason, usage) →
+`message_stop`. Exactly one terminal outcome; post-commit failures emit one
+`error` event and never fabricate `message_stop`; OpenAI `[DONE]` never leaks.
+
+### Token counting
+
+`POST /v1/messages/count_tokens` is served only by providers with the native
+`anthropicTokenCount` capability and relays the exact upstream count. The
+proxy **never estimates**: without a capable provider it returns an explicit
+error instead of a character-based guess.
+
+### Errors
+
+Anthropic endpoints return Anthropic-shaped errors
+(`{"type":"error","error":{"type":"invalid_request_error","message":"…"},
+"request_id":"…"}`); OpenAI endpoints keep the OpenAI shape. Messages are
+sanitized and stable — no upstream bodies, keys, headers or stack traces.
+
+## Project Structure
+
+```
+src/
+  app.js            entry point (npm start)
+  server.js         HTTP server, graceful shutdown
+  api/              protocol edges: chat-completions, responses, anthropic-messages
+  core/             shared transport core: router (failover loop), upstream,
+                    stream-core, streaming, key-manager, errors, logger, config
+  providers/        provider interface + capability-aware registry
+  formats/          protocol translators: responses-*, anthropic-*
+test/
+  integration/      real-HTTP integration suites (chat, responses, anthropic)
+  helpers/          mock upstreams + HTTP test client
+docs/               build reports
+```
+
 ## Provider Capabilities
 
 Declare per-provider capabilities to gate routing and field support:
@@ -250,6 +363,8 @@ Declare per-provider capabilities to gate routing and field support:
 # reasoning / previousResponseId gate those fields natively
 OPENAI_CAPABILITIES=responses=native,reasoning=true,previousResponseId=true
 ALT_CAPABILITIES=responses=translated
+# Anthropic-native provider (e.g. api.anthropic.com):
+ANTHROPIC_CAPABILITIES=anthropicMessages=native,anthropicTokenCount=native,thinking=true,betas=true
 ```
 
 Example: an OpenAI-compatible upstream that has no `/v1/responses` endpoint:
@@ -484,3 +599,8 @@ OpenAI-compatible error format (single top-level `error` object, HTTP status in 
 ## License
 
 MIT
+
+---
+
+**Status:** early development release (Build 3 of 10). Not yet stable or
+production-ready; interfaces and behavior may change between builds.

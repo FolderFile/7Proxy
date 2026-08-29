@@ -11,16 +11,8 @@
  */
 
 /** Error signaling a request field the target provider cannot represent. */
-export class UnsupportedFieldError extends Error {
-  constructor(param, reason) {
-    super(reason
-      ? `Parameter '${param}': ${reason}`
-      : `Parameter '${param}' is not supported by this provider`);
-    this.name = 'UnsupportedFieldError';
-    this.param = param;
-    this.reason = reason || null;
-  }
-}
+import { UnsupportedFieldError } from './unsupported-field.js';
+export { UnsupportedFieldError };
 
 const KNOWN_FIELDS = [
   'model', 'input', 'instructions', 'stream', 'temperature', 'top_p',
