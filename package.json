@@ -1,0 +1,24 @@
+{
+  "name": "seven-proxy",
+  "version": "0.2.0",
+  "description": "7Proxy - production-ready lightweight OpenAI-compatible AI proxy (Chat Completions + Responses APIs)",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "start": "node app.js",
+    "test": "node test.js && node test-responses.js",
+    "dev": "node --watch app.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "openai",
+    "proxy",
+    "ai",
+    "llm",
+    "streaming",
+    "responses-api"
+  ],
+  "license": "MIT"
+}
