@@ -13,7 +13,7 @@
  */
 
 import { UnsupportedFieldError } from './responses-request.js';
-import { Errors } from './errors.js';
+import { Errors } from '../core/errors.js';
 
 /**
  * Validate a Responses request against a native provider's capabilities.

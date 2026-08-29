@@ -8,9 +8,10 @@
 import http from 'http';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
-import { dirname } from 'path';
+import { join, dirname } from 'path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const PROJECT_ROOT = join(__dirname, '..', '..');
 
 /**
  * Create a mock upstream.
@@ -332,8 +333,8 @@ export function createMock(opts = {}) {
  */
 export function startProxy(env) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(process.execPath, ['app.js'], {
-      cwd: __dirname,
+    const proc = spawn(process.execPath, ['src/app.js'], {
+      cwd: PROJECT_ROOT,
       env: { PATH: process.env.PATH, ...env },
       stdio: ['pipe', 'pipe', 'pipe']
     });

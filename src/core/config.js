@@ -9,8 +9,11 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+/** Project root: two levels above src/core/. Portable across OSes. */
+const PROJECT_ROOT = join(__dirname, '..', '..');
+
 function parseEnvFile() {
-  const envPath = join(__dirname, '.env');
+  const envPath = join(PROJECT_ROOT, '.env');
   if (!existsSync(envPath)) return;
   let content;
   try {

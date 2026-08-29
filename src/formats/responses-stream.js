@@ -13,8 +13,8 @@
  * Unknown native event types are passed through untouched (forward compatible).
  */
 
-import { logger } from './logger.js';
-import { pumpStream } from './stream-core.js';
+import { logger } from '../core/logger.js';
+import { pumpStream } from '../core/stream-core.js';
 import { ChatToResponsesStreamTranslator, sseEvent } from './responses-translate.js';
 
 function drain(res) {

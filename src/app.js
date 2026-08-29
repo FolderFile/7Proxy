@@ -4,11 +4,11 @@
  * Entry point
  */
 
-import { loadConfig } from './config.js';
+import { loadConfig } from './core/config.js';
 import { ProviderRegistry } from './providers/index.js';
-import { createRouter } from './router.js';
+import { createRouter } from './core/router.js';
 import { createServer } from './server.js';
-import { logger } from './logger.js';
+import { logger } from './core/logger.js';
 
 async function main() {
   try {

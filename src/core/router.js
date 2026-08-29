@@ -21,10 +21,10 @@ import { Errors, classifyNetworkError } from './errors.js';
 import { KeyManager } from './key-manager.js';
 import { makeUpstreamRequest } from './upstream.js';
 import { streamResponse } from './streaming.js';
-import { streamResponses } from './responses-stream.js';
-import { translateResponsesRequest, UnsupportedFieldError } from './responses-request.js';
-import { validateNativeResponsesBody, validateNativeResponsesObject } from './responses-native.js';
-import { translateChatResponseToResponses, ChatToResponsesStreamTranslator } from './responses-translate.js';
+import { streamResponses } from '../formats/responses-stream.js';
+import { translateResponsesRequest, UnsupportedFieldError } from '../formats/responses-request.js';
+import { validateNativeResponsesBody, validateNativeResponsesObject } from '../formats/responses-native.js';
+import { translateChatResponseToResponses, ChatToResponsesStreamTranslator } from '../formats/responses-translate.js';
 
 const SAFE_METHODS = new Set(['GET', 'POST', 'OPTIONS']);
 
@@ -497,19 +497,6 @@ export function createRouter(config, registry) {
       // API edge: per-provider request preparation.
       //  - native:      body validated & forwarded as-is (endpoint /v1/responses)
       //  - translated:  Responses -> Chat Completions translation
-      prepareBody: (provider) => {
-        const mode = provider.capabilities.responses;
-        if (mode === 'native') {
-          // Native: forward as-is. Capability gating for power fields.
-          validateNativeResponsesBody(body, provider.capabilities);
-          return body;
-        }
-        return translateResponsesRequest(body, provider.capabilities);
-      },
-      // Pre-commit validation. The check depends on which format the provider
-      // will actually return:
-      //  - native:      validate the Responses object itself
-      //  - translated:  validate the Chat Completions shape before translating
       prepareBody: (provider) => {
         const mode = provider.capabilities.responses;
         if (mode === 'native') {

@@ -7,8 +7,8 @@
  */
 
 import assert from 'assert';
-import { createMock, startProxy } from './test-mock.js';
-import { request, streamRequest, requestWithAbort } from './test-client.js';
+import { createMock, startProxy } from '../helpers/mock-upstream.js';
+import { request, streamRequest, requestWithAbort } from '../helpers/http-client.js';
 
 let portCounter = 48300;
 

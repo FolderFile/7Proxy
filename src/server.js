@@ -3,7 +3,7 @@
  */
 
 import http from 'http';
-import { logger } from './logger.js';
+import { logger } from './core/logger.js';
 
 export function createServer(config, router) {
   const server = http.createServer({

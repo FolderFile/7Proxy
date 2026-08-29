@@ -12,7 +12,7 @@
  *  - Exactly one terminal event; never emit Chat Completions data: [DONE].
  */
 
-import { logger } from './logger.js';
+import { logger } from '../core/logger.js';
 
 let idCounter = 0;
 /** Stable unique ids for synthesized Responses objects. */

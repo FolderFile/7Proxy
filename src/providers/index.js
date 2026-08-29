@@ -3,7 +3,7 @@
  */
 
 import { createProvider } from './base.js';
-import { logger } from '../logger.js';
+import { logger } from '../core/logger.js';
 
 export class ProviderRegistry {
   constructor(providerConfigs, defaultProviderName) {
