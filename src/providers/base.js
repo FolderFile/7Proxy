@@ -67,6 +67,31 @@ export function normalizeCapabilities(caps = {}) {
   };
 }
 
+/**
+ * Bare upstream header construction shared by adapters (no provider object
+ * needed): per-API auth shape + safe static headers.
+ */
+export function __bareHeaderBuilder(apiKey, api = 'chat', extraHeaders = {}, caps = {}) {
+  const base = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    // Disable transparent decompression so streaming bytes are raw SSE.
+    'Accept-Encoding': 'identity'
+  };
+  if (api === 'anthropic-messages' || api === 'anthropic-token-count') {
+    return {
+      ...base,
+      'x-api-key': apiKey,
+      'anthropic-version': extraHeaders['anthropic-version'] || caps.anthropicVersion || '2023-06-01',
+      ...(extraHeaders['anthropic-beta'] ? { 'anthropic-beta': extraHeaders['anthropic-beta'] } : {})
+    };
+  }
+  return {
+    ...base,
+    'Authorization': `Bearer ${apiKey}`
+  };
+}
+
 export function createProvider(config) {
   const baseUrl = (config.baseUrl || '').replace(/\/$/, '');
   const capabilities = normalizeCapabilities(config.capabilities);
@@ -109,27 +134,7 @@ export function createProvider(config) {
      * own key entry and configuration.
      */
     buildHeaders(apiKey, api = 'chat', extraHeaders = {}) {
-      const base = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        // Disable transparent decompression so streaming bytes are raw SSE.
-        'Accept-Encoding': 'identity'
-      };
-      if (api === 'anthropic-messages' || api === 'anthropic-token-count') {
-        // Anthropic-native authentication and versioning.
-        return {
-          ...base,
-          'x-api-key': apiKey,
-          'anthropic-version': extraHeaders['anthropic-version'] || this.capabilities.anthropicVersion || '2023-06-01',
-          ...(extraHeaders['anthropic-beta'] ? { 'anthropic-beta': extraHeaders['anthropic-beta'] } : {}),
-          ...extraHeaders.safe
-        };
-      }
-      return {
-        ...base,
-        'Authorization': `Bearer ${apiKey}`,
-        ...extraHeaders.safe
-      };
+      return __bareHeaderBuilder(apiKey, api, extraHeaders, this.capabilities);
     },
 
     supportsModel(model) {

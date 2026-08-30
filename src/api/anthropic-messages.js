@@ -114,7 +114,7 @@ async function readAnthropicBody(req, res, config, rid) {
 }
 
 export function createAnthropicHandlers(ctx) {
-  const { config, registry, runWithFailover } = ctx;
+  const { config, registry, routingRegistry, runWithFailover } = ctx;
 
   /** POST /v1/messages */
   async function handleMessagesCreate(req, res, rid) {
@@ -134,22 +134,39 @@ export function createAnthropicHandlers(ctx) {
       return;
     }
 
-    if (!registry.getByModel(body.model)) {
+    if (routingRegistry) {
+      if (!routingRegistry.has(body.model)) {
+        sendAnthropicError(res, 404,
+          AnthropicErrors.unsupportedEndpoint('Messages', body.model, rid), rid);
+        return;
+      }
+    } else if (!registry.getByModel(body.model)) {
       sendAnthropicError(res, 404,
         AnthropicErrors.unsupportedEndpoint('Messages', body.model, rid), rid);
       return;
     }
 
     const wantsStream = body.stream === true;
-    logger.info('Anthropic Messages request', { requestId: rid, model: body.model,
-      provider: registry.getByModel(body.model).name, stream: wantsStream });
 
     // Capability pre-flight: no provider can serve Messages for this model.
-    const capable = registry.getCapableFailoverProviders(body.model, 'anthropic-messages', body);
-    if (capable.length === 0) {
-      sendAnthropicError(res, 404,
-        AnthropicErrors.unsupportedEndpoint('Messages', body.model, rid), rid);
-      return;
+    if (routingRegistry) {
+      const resolution = routingRegistry.resolve(body.model, 'anthropic-messages', body);
+      if (!resolution || resolution.plan.length === 0) {
+        sendAnthropicError(res, 404,
+          AnthropicErrors.unsupportedEndpoint('Messages', body.model, rid), rid);
+        return;
+      }
+      logger.info('Anthropic Messages request', { requestId: rid, model: body.model,
+        provider: resolution.resolvedName ?? '', stream: wantsStream });
+    } else {
+      const capable = registry.getCapableFailoverProviders(body.model, 'anthropic-messages', body);
+      if (capable.length === 0) {
+        sendAnthropicError(res, 404,
+          AnthropicErrors.unsupportedEndpoint('Messages', body.model, rid), rid);
+        return;
+      }
+      logger.info('Anthropic Messages request', { requestId: rid, model: body.model,
+        provider: registry.getByModel(body.model).name, stream: wantsStream });
     }
 
     await runWithFailover({
@@ -159,16 +176,19 @@ export function createAnthropicHandlers(ctx) {
       anthropicVersion: hdr.version,
       // Provider-scoped extra headers (validated version + gated beta).
       headerPolicy: (provider) => nativeUpstreamExtra(provider, req),
-      prepareBody: (provider) => {
+      prepareBody: (provider, upstreamModel) => {
+        // The public model name is rewritten to the target's upstream id on a
+        // fresh object; the client request object is never mutated.
+        const publicBody = upstreamModel === body.model ? body : { ...body, model: upstreamModel };
         const mode = provider.capabilities.anthropicMessages;
         if (mode === 'native') {
-          // Native: forward verbatim after field gating (throws
-          // UnsupportedFieldError to trigger zero-cost provider skip).
-          validateNativeAnthropicBody(body, provider.capabilities);
-          return body;
+          // Native: forward the public body verbatim after field gating
+          // (throws UnsupportedFieldError to trigger zero-cost provider skip).
+          validateNativeAnthropicBody(publicBody, provider.capabilities);
+          return publicBody;
         }
         // Translated: Anthropic Messages -> Chat Completions.
-        return translateAnthropicRequest(body, provider.capabilities);
+        return translateAnthropicRequest(publicBody, provider.capabilities);
       },
       // Pre-commit validation, mode-aware (failover Before Commit).
       validateResult: (result, provider) => {
@@ -193,7 +213,11 @@ export function createAnthropicHandlers(ctx) {
             // Relay the validated native Anthropic Message object unchanged.
             sendAnthropicJson(res, result.body, rid);
           } else {
-            sendAnthropicJson(res, translateChatResponseToAnthropic(result.body, upstreamBody), rid);
+            // Report the public requested model consistently in translated
+            // responses (upstream model ids are internal).
+            sendAnthropicJson(res,
+              translateChatResponseToAnthropic(result.body,
+                { ...upstreamBody, model: body.model, publicModel: body.model }), rid);
           }
           return;
         }
@@ -228,7 +252,8 @@ export function createAnthropicHandlers(ctx) {
           {
             requestId: rid, provider: provider.name,
             mode: mode === 'native' ? 'native' : 'translated',
-            anthropicRequest: upstreamBody
+            // The translator reports the public requested model.
+            anthropicRequest: { ...upstreamBody, model: body.model }
           },
           clientCtrl.signal,
           { inactivityTimeoutMs: config.streamTimeoutMs, overallTimeoutMs: config.streamOverallTimeoutMs }
@@ -268,7 +293,13 @@ export function createAnthropicHandlers(ctx) {
       return;
     }
 
-    if (!registry.getByModel(body.model)) {
+    if (routingRegistry) {
+      if (!routingRegistry.has(body.model)) {
+        sendAnthropicError(res, 404,
+          AnthropicErrors.unsupportedEndpoint('Token count', body.model, rid), rid);
+        return;
+      }
+    } else if (!registry.getByModel(body.model)) {
       sendAnthropicError(res, 404,
         AnthropicErrors.unsupportedEndpoint('Token count', body.model, rid), rid);
       return;
@@ -277,11 +308,20 @@ export function createAnthropicHandlers(ctx) {
     // Only native token-count providers can serve counting; the proxy never
     // estimates and never invents counts. Pre-flight avoids consuming
     // generation-style attempts on providers that cannot serve the endpoint.
-    const capable = registry.getCapableFailoverProviders(body.model, 'anthropic-token-count', body);
-    if (capable.length === 0) {
-      sendAnthropicError(res, 404, AnthropicErrors.invalidRequest(
-        'token counting requires a provider with native token-count support; counts are never estimated', rid), rid);
-      return;
+    if (routingRegistry) {
+      const resolution = routingRegistry.resolve(body.model, 'anthropic-token-count', body);
+      if (!resolution || resolution.plan.length === 0) {
+        sendAnthropicError(res, 404, AnthropicErrors.invalidRequest(
+          'token counting requires a provider with native token-count support; counts are never estimated', rid), rid);
+        return;
+      }
+    } else {
+      const capable = registry.getCapableFailoverProviders(body.model, 'anthropic-token-count', body);
+      if (capable.length === 0) {
+        sendAnthropicError(res, 404, AnthropicErrors.invalidRequest(
+          'token counting requires a provider with native token-count support; counts are never estimated', rid), rid);
+        return;
+      }
     }
 
     await runWithFailover({
@@ -290,14 +330,16 @@ export function createAnthropicHandlers(ctx) {
       body,
       anthropicVersion: hdr.version,
       headerPolicy: (provider) => nativeUpstreamExtra(provider, req),
-      prepareBody: (provider) => {
+      prepareBody: (provider, upstreamModel) => {
         if (provider.capabilities.anthropicTokenCount !== 'native') {
           throw new UnsupportedFieldError('count_tokens', 'provider does not offer exact token counting');
         }
         // Preserve counting-relevant fields; the upstream count endpoint does
-        // not take max_tokens/stream, so they are not forwarded.
+        // not take max_tokens/stream, so they are not forwarded. The public
+        // model name is rewritten to the target's upstream id on a fresh
+        // object (never mutating the client request object).
         const { stream: _s, max_tokens: _m, ...countBody } = body;
-        return countBody;
+        return upstreamModel === body.model ? countBody : { ...countBody, model: upstreamModel };
       },
       validateResult: (result) => {
         if (result.kind !== 'json') return null;

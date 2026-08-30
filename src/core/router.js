@@ -3,17 +3,28 @@
  *
  * Architecture:
  *  - A transport-independent core is shared by every API surface:
- *      buildAttemptPlan (provider selection + key selection order),
  *      the attempt loop (key cooldown/disable, retry classification,
- *      attempt budgeting, provider failover, abortable backoff),
+ *      attempt budgeting, provider/key failover, abortable backoff),
  *      makeUpstreamRequest (upstream.js: fetch + timeout + cancellation),
  *      readBody, sendError/sendJson, CORS/auth, logging, error mapping.
- *  - API-specific logic lives at the edges only: request parsing/validation
- *    and response serialization (chat completions vs responses).
+ *  - API-specific logic lives at the edges only (src/api/*): request
+ *    parsing/validation and response serialization.
  *  - A response is "committed" only once we start writing to `res`. After
  *    commit we NEVER retry and NEVER start another generation.
  *  - Total upstream attempts are capped by config.maxAttempts across all keys
  *    and providers; the same (provider,key) is never attempted twice.
+ *
+ * Build 4 routing:
+ *  - public names (direct models, aliases, routing groups) resolve through the
+ *    immutable ModelRoutingRegistry into an ordered target plan BEFORE any
+ *    upstream call; strategies (fallback | round-robin | random |
+ *    weighted-random) order targets and never mutate configuration;
+ *  - each plan entry carries the exact upstreamModel id; prepareBody rewrites
+ *    the model field so clients never see internal upstream names;
+ *  - the plan is finite (<= declared targets); this loop's global attempt
+ *    budget remains authoritative (a large group cannot multiply attempts);
+ *  - key rotation walks every key of a target before the next target;
+ *  - client objects are never mutated: upstream bodies are fresh objects.
  */
 
 import { logger } from './logger.js';
@@ -69,11 +80,14 @@ function jitteredDelay(attempt, base, max) {
   return Math.floor(Math.random() * exp);
 }
 
-export function createRouter(config, registry) {
+export function createRouter(config, registry, routingRegistry = null) {
   // One key manager per provider.
   const keyManagers = new Map();
-  for (const provider of registry.getAll()) {
-    keyManagers.set(provider.name, new KeyManager(provider.apiKeys, config.keyCooldownMs));
+  const providers = routingRegistry
+    ? [...routingRegistry.providers.values()]
+    : registry.getAll();
+  for (const provider of providers) {
+    keyManagers.set(provider.name, new KeyManager([...provider.apiKeys], config.keyCooldownMs));
   }
 
   function corsHeaders(req, res) {
@@ -110,29 +124,16 @@ export function createRouter(config, registry) {
       { 'X-Request-Id': rid });
   }
 
-  function handleModelsList(req, res, rid) {
-    sendJson(res, 200, { object: 'list', data: registry.getAllModels() }, { 'X-Request-Id': rid });
-  }
-
-  function handleModelLookup(req, res, rid, modelId) {
-    const model = registry.getModel(modelId);
-    if (!model) {
-      sendError(res, 404, Errors.notFound(`Model '${modelId}'`), { 'X-Request-Id': rid });
-      return;
-    }
-    sendJson(res, 200, model, { 'X-Request-Id': rid });
-  }
-
   /**
-   * Build the ordered attempt plan: list of {provider, keyEntry} pairs.
-   * Capability-filtered (only providers that can serve `api`), model owner
-   * first (round-robin start), then other capable providers. Each (provider,
-   * key) appears at most once.
+   * Build the ordered attempt lanes: list of {target, provider, km, keyEntry}.
+   * A lane is one (target, key) pair; every pair appears at most once and the
+   * lane list never exceeds plan.length * keys-per-provider. The loop below
+   * enforces the global attempt budget regardless of lane count.
    */
-  function buildAttemptPlan(model, api, body) {
-    const providers = registry.getCapableFailoverProviders(model, api, body);
-    const plan = [];
-    for (const provider of providers) {
+  function buildAttemptLanes(plan) {
+    const lanes = [];
+    for (const target of plan) {
+      const { provider, upstreamModel } = target;
       const km = keyManagers.get(provider.name);
       if (!km) continue;
       // Start from the round-robin position so concurrent requests spread
@@ -140,18 +141,18 @@ export function createRouter(config, registry) {
       const start = km.robinIndex % km.keys.length;
       for (let i = 0; i < km.keys.length; i++) {
         const keyEntry = km.keys[(start + i) % km.keys.length];
-        plan.push({ provider, km, keyEntry });
+        lanes.push({ target, provider, upstreamModel, km, keyEntry });
       }
       // Advance the round-robin so the next request starts on a different key.
       km.robinIndex = (km.robinIndex + 1) % km.keys.length;
     }
-    return plan;
+    return lanes;
   }
 
   /**
    * Error-shape adapter: OpenAI endpoints keep OpenAI-shaped errors; Anthropic
    * endpoints receive Anthropic-shaped errors with identical sanitized status
-   * semantics (lazy import avoided: handler modules register their mapper).
+   * semantics.
    */
   const errorMappers = {
     chat: (res, err, rid, statusCode) =>
@@ -181,7 +182,7 @@ export function createRouter(config, registry) {
    * Shared attempt/failover loop used by every API surface.
    *
    * @param {object} args
-   * @param {string} args.api - 'chat' | 'responses'
+   * @param {string} args.api - 'chat' | 'responses' | 'anthropic-messages' | 'anthropic-token-count'
    * @param {object} args.body - validated client request body (with .model)
    * @param {Function} args.prepareBody - (provider) => upstreamBody; may throw
    *        UnsupportedFieldError (field not representable by that provider)
@@ -198,16 +199,30 @@ export function createRouter(config, registry) {
     req.on('close', onClientClose);
 
     try {
-      const plan = buildAttemptPlan(body.model, api, body);
+      // Resolve the public model name to an ordered target plan BEFORE any
+      // attempt is spent. Unknown names are the edges' responsibility (edges
+      // 404 before calling here); an empty plan means no capable provider.
+      let plan;
+      if (routingRegistry) {
+        const resolution = routingRegistry.resolve(body.model, api, body);
+        plan = resolution ? resolution.plan : [];
+      } else {
+        // Legacy fallback (routing registry not wired): capability-filtered
+        // provider list over the raw model name.
+        plan = registry.getCapableFailoverProviders(body.model, api, body)
+          .map(provider => ({ provider, providerId: provider.name, upstreamModel: body.model }));
+      }
+      const lanes = buildAttemptLanes(plan);
       const attempted = new Set(); // "provider:keyIndex"
       let attempts = 0;
       let committed = false;
       let firstUnsupported = null;
+      let expectStream = false;
 
-      for (let i = 0; i < plan.length && attempts < config.maxAttempts; i++) {
+      for (let i = 0; i < lanes.length && attempts < config.maxAttempts; i++) {
         if (clientCtrl.signal.aborted) break;
 
-        const { provider, km, keyEntry } = plan[i];
+        const { target, provider, upstreamModel, km, keyEntry } = lanes[i];
         const sig = `${provider.name}:${keyEntry.index}`;
 
         // Skip disabled keys and keys in cooldown.
@@ -218,10 +233,12 @@ export function createRouter(config, registry) {
 
         // API edge: build the upstream body for this provider. A field the
         // provider cannot represent is NOT a failed upstream attempt; we move
-        // to the next capable provider (or reject at the end).
+        // to the next capable provider (or reject at the end). The public
+        // model name is rewritten to the target's exact upstream model id on
+        // a fresh object - the client request object is never mutated.
         let upstreamBody;
         try {
-          upstreamBody = prepareBody(provider);
+          upstreamBody = prepareBody(provider, upstreamModel);
         } catch (err) {
           if (err instanceof UnsupportedFieldError) {
             if (!firstUnsupported) firstUnsupported = err;
@@ -237,45 +254,17 @@ export function createRouter(config, registry) {
 
         let result;
         try {
-          // Endpoint selection per API and provider mode:
-          //  - chat                     -> /v1/chat/completions
-          //  - responses (native)       -> /v1/responses (else chat endpoint)
-          //  - anthropic-messages       -> provider Messages endpoint
-          //                                (native) or chat endpoint (translated)
-          //  - anthropic-token-count    -> provider count_tokens endpoint
-          let endpoint;
-          let expectStream;
-          if (api === 'chat') {
-            endpoint = provider.getChatEndpoint();
-            expectStream = upstreamBody.stream === true;
-          } else if (api === 'responses') {
-            endpoint = provider.capabilities.responses === 'native'
-              ? provider.getResponsesEndpoint()
-              : provider.getChatEndpoint();
-            expectStream = upstreamBody.stream === true;
-          } else if (api === 'anthropic-messages') {
-            endpoint = provider.capabilities.anthropicMessages === 'native'
-              ? provider.getMessagesEndpoint()
-              : provider.getChatEndpoint();
-            expectStream = upstreamBody.stream === true;
-          } else if (api === 'anthropic-token-count') {
-            endpoint = provider.getCountTokensEndpoint();
-            expectStream = false;
-          } else {
-            endpoint = provider.getChatEndpoint();
-            expectStream = upstreamBody.stream === true;
-          }
+          // Endpoint + headers come from the provider adapter: never per-name
+          // conditions here, never inbound credentials upstream.
+          const endpoint = provider.getEndpointFor
+            ? provider.getEndpointFor(api)
+            : legacyEndpointFor(provider, api);
+          expectStream = upstreamBody.stream === true;
 
-          // Per-API upstream headers. Anthropic-native calls authenticate via
-          // x-api-key + anthropic-version; everything else uses Bearer. The
-          // headerPolicy hook (set by the Anthropic edge) constructs these
-          // from the provider key ONLY - the inbound proxy key never travels.
           const extraHeaders = headerPolicy
             ? headerPolicy(provider, keyEntry.key, anthropicVersion)
             : {};
-          const upstreamHeaders = api === 'anthropic-messages' || api === 'anthropic-token-count'
-            ? provider.buildHeaders(keyEntry.key, api, extraHeaders)
-            : provider.buildHeaders(keyEntry.key);
+          const upstreamHeaders = provider.buildHeaders(keyEntry.key, api, extraHeaders);
 
           result = await makeUpstreamRequest({
             provider,
@@ -340,7 +329,7 @@ export function createRouter(config, registry) {
         }
 
         // Backoff before next attempt (abortable, jittered).
-        if (attempts < config.maxAttempts && i + 1 < plan.length) {
+        if (attempts < config.maxAttempts && i + 1 < lanes.length) {
           const delay = jitteredDelay(attempts - 1, config.retryBaseDelayMs, config.retryMaxDelayMs);
           if (delay > 0) {
             const waited = await backoff(delay, clientCtrl.signal);
@@ -369,10 +358,27 @@ export function createRouter(config, registry) {
     }
   }
 
+  /** Legacy endpoint selection (providers without adapters; env-only mode). */
+  function legacyEndpointFor(provider, api) {
+    switch (api) {
+      case 'responses':
+        return provider.capabilities.responses === 'native'
+          ? provider.getResponsesEndpoint() : provider.getChatEndpoint();
+      case 'anthropic-messages':
+        return provider.capabilities.anthropicMessages === 'native'
+          ? provider.getMessagesEndpoint() : provider.getChatEndpoint();
+      case 'anthropic-token-count':
+        return provider.getCountTokensEndpoint();
+      case 'chat':
+      default:
+        return provider.getChatEndpoint();
+    }
+  }
+
   // API handlers live in src/api/* (protocol edges). They receive a shared
-  // context: config, registry, runWithFailover, sseHead, timing helper.
+  // context: config, registry, routing registry, runWithFailover, sseHead.
   const apiCtx = {
-    config, registry, runWithFailover,
+    config, registry, routingRegistry, runWithFailover,
     sseHead,
     now: () => Date.now(),
     /** API edges register Anthropic-shaped error mappers here. */
@@ -428,6 +434,35 @@ export function createRouter(config, registry) {
       if (!res.headersSent) sendError(res, 500, Errors.internal(), { 'X-Request-Id': rid });
     }
   };
+
+  // ---- model introspection (uses the routing registry when available) ------
+  function handleModelsList(req, res, rid) {
+    if (routingRegistry) {
+      sendJson(res, 200,
+        { object: 'list', data: routingRegistry.listPublicModels() },
+        { 'X-Request-Id': rid });
+      return;
+    }
+    sendJson(res, 200, { object: 'list', data: registry.getAllModels() }, { 'X-Request-Id': rid });
+  }
+
+  function handleModelLookup(req, res, rid, modelId) {
+    if (routingRegistry) {
+      const model = routingRegistry.lookupPublicModel(modelId);
+      if (!model) {
+        sendError(res, 404, Errors.notFound(`Model '${modelId}'`), { 'X-Request-Id': rid });
+        return;
+      }
+      sendJson(res, 200, model, { 'X-Request-Id': rid });
+      return;
+    }
+    const model = registry.getModel(modelId);
+    if (!model) {
+      sendError(res, 404, Errors.notFound(`Model '${modelId}'`), { 'X-Request-Id': rid });
+      return;
+    }
+    sendJson(res, 200, model, { 'X-Request-Id': rid });
+  }
 }
 
 export default createRouter;

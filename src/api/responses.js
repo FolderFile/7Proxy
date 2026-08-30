@@ -16,7 +16,7 @@ import { validateNativeResponsesBody, validateNativeResponsesObject } from '../f
 import { translateChatResponseToResponses, ChatToResponsesStreamTranslator } from '../formats/responses-translate.js';
 
 export function createResponsesHandler(ctx) {
-  const { config, registry, runWithFailover } = ctx;
+  const { config, registry, routingRegistry, runWithFailover } = ctx;
 
   /** POST /v1/responses */
   async function handleResponses(req, res, rid) {
@@ -47,7 +47,12 @@ export function createResponsesHandler(ctx) {
       return;
     }
 
-    if (!registry.getByModel(model)) {
+    if (routingRegistry) {
+      if (!routingRegistry.has(model)) {
+        sendError(res, 404, Errors.notFound(`Model '${model}'`), { 'X-Request-Id': rid });
+        return;
+      }
+    } else if (!registry.getByModel(model)) {
       sendError(res, 404, Errors.notFound(`Model '${model}'`), { 'X-Request-Id': rid });
       return;
     }
@@ -56,28 +61,45 @@ export function createResponsesHandler(ctx) {
 
     // Capability pre-flight: if NO provider can serve Responses for this body
     // (including field-level constraints), reject before any upstream call.
-    const capable = registry.getCapableFailoverProviders(model, 'responses', body);
-    if (capable.length === 0) {
-      sendError(res, 400, Errors.unsupportedEndpoint('Responses', model), { 'X-Request-Id': rid });
-      return;
+    if (routingRegistry) {
+      const resolution = routingRegistry.resolve(model, 'responses', body);
+      if (!resolution || resolution.plan.length === 0) {
+        sendError(res, 400, Errors.unsupportedEndpoint('Responses', model), { 'X-Request-Id': rid });
+        return;
+      }
+    } else {
+      const capable = registry.getCapableFailoverProviders(model, 'responses', body);
+      if (capable.length === 0) {
+        sendError(res, 400, Errors.unsupportedEndpoint('Responses', model), { 'X-Request-Id': rid });
+        return;
+      }
     }
 
-    logger.info('Responses request', { requestId: rid, model,
-      provider: registry.getByModel(model).name, stream: wantsStream });
+    if (routingRegistry) {
+      logger.info('Responses request', { requestId: rid, model,
+        provider: routingRegistry.resolveAny(model)?.resolvedName ?? '', stream: wantsStream });
+    } else {
+      logger.info('Responses request', { requestId: rid, model,
+        provider: registry.getByModel(model).name, stream: wantsStream });
+    }
 
     await runWithFailover({
       req, res, rid,
       api: 'responses',
       body,
-      // API edge: per-provider request preparation.
-      prepareBody: (provider) => {
+      // API edge: per-provider request preparation. The public model name is
+      // rewritten to the target's upstream id on a fresh object (the client
+      // request object is never mutated).
+      prepareBody: (provider, upstreamModel) => {
+        const publicBody = upstreamModel === body.model ? body : { ...body, model: upstreamModel };
         const mode = provider.capabilities.responses;
         if (mode === 'native') {
-          // Native: forward as-is. Capability gating for power fields.
-          validateNativeResponsesBody(body, provider.capabilities);
-          return body;
+          // Native: forward as-is (public model reported in the response by
+          // documenting passthrough; validation is field-gating only).
+          validateNativeResponsesBody(publicBody, provider.capabilities);
+          return publicBody;
         }
-        return translateResponsesRequest(body, provider.capabilities);
+        return translateResponsesRequest(publicBody, provider.capabilities);
       },
       validateResult: (result, provider) => {
         if (provider.capabilities.responses === 'native') {
@@ -101,8 +123,10 @@ export function createResponsesHandler(ctx) {
             // Preserve the native Responses object.
             sendJson(res, 200, result.body, { 'X-Request-Id': rid });
           } else {
-            // Translate chat completion -> Responses object.
-            sendJson(res, 200, translateChatResponseToResponses(result.body, upstreamBody),
+            // Translate chat completion -> Responses object. The public
+            // requested model is reported in the translated object.
+            sendJson(res, 200, translateChatResponseToResponses(result.body,
+              { ...upstreamBody, model: body.model }),
               { 'X-Request-Id': rid });
           }
           return;
@@ -117,7 +141,7 @@ export function createResponsesHandler(ctx) {
             const ok = res.write(`data: ${JSON.stringify(result.json)}\n\n`);
             if (!ok) await new Promise(r => res.once('drain', r));
           } else {
-            const translator = new ChatToResponsesStreamTranslator(upstreamBody);
+            const translator = new ChatToResponsesStreamTranslator({ ...upstreamBody, model: body.model });
             for (const e of translator.initialEvents()) res.write(e);
             for (const e of translator.onChatChunk(result.json)) res.write(e);
             for (const e of translator.finalEvents()) {
@@ -139,7 +163,9 @@ export function createResponsesHandler(ctx) {
             inactivityTimeoutMs: config.streamTimeoutMs,
             overallTimeoutMs: config.streamOverallTimeoutMs,
             mode: mode === 'native' ? 'native' : 'translated',
-            requestBody: upstreamBody
+            // streamResponses re-runs the translated lifecycle from the chat
+            // deltas; report the public model there too.
+            requestBody: { ...upstreamBody, model: body.model }
           }
         );
       }

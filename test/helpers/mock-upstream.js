@@ -170,7 +170,14 @@ export function createMock(opts = {}) {
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify(body ?? defaultAnthropicMessage));
               return;
-          }
+            }
+            if (anthropicBehavior === 'message-echo-model') {
+              // Non-streaming Message whose model field echoes the request's
+              // model id - lets tests assert exact upstream model rewriting.
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ...defaultAnthropicMessage, model: parsed?.model ?? 'echo-none' }));
+              return;
+            }
             if (anthropicBehavior === 'messages-stream') {
               sendAnthropicSse(anthropicEvents ?? defaultAnthropicEvents);
               return;
@@ -258,6 +265,18 @@ export function createMock(opts = {}) {
           case 'status': {
             res.writeHead(status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(body ?? { error: { message: `upstream ${status}` } }));
+            return;
+          }
+          case 'json-echo-object': {
+            // Wrap the incoming object in a valid chat.completion with the
+            // requested model echoed - asserts exact upstream model rewriting.
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              id: 'chatcmpl-echo', object: 'chat.completion', created: 1234567890,
+              model: parsed?.model ?? 'echo-none',
+              choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+            }));
             return;
           }
           case 'json': {

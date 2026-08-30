@@ -1,11 +1,24 @@
 /**
  * Configuration management with startup validation.
+ *
+ * Two configuration sources (Build 4):
+ *   1. Legacy environment-only provider configuration (unchanged behavior;
+ *      OpenAI / Anthropic / ALT slots).
+ *   2. A declarative JSON file (config/7proxy.json, override with
+ *      SEVEN_PROXY_CONFIG) with providers, explicit models, aliases, routing
+ *      groups and per-group strategies. Keys are always resolved from
+ *      environment variables - never stored inline in the file.
+ *
+ * Priority: SEVEN_PROXY_CONFIG > config/7proxy.json (if present) > env-only.
+ * Environment variables always override file-level SERVER settings
+ * (PORT, HOST, timeouts, attempt budgets, cooldown, PROXY_API_KEY).
  */
 
 import { logger } from './logger.js';
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { loadJsonConfig, resolveConfigPath, defaultConfigExists } from '../config/loader.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -44,6 +57,17 @@ function intEnv(name, def) {
   return Number.isFinite(n) ? n : def;
 }
 
+/**
+ * Load the declarative JSON configuration when requested. Returns the loader
+ * result or null (legacy env-only mode). Throws with the config path (never
+ * values) when an explicitly requested file is missing or invalid.
+ */
+function tryLoadFileConfig() {
+  const explicit = process.env.SEVEN_PROXY_CONFIG !== undefined && process.env.SEVEN_PROXY_CONFIG !== '';
+  if (!explicit && !defaultConfigExists()) return null;
+  return loadJsonConfig(resolveConfigPath());
+}
+
 function parseKeys(keyString) {
   if (!keyString) return [];
   return keyString
@@ -69,6 +93,10 @@ export function loadConfig() {
     host: process.env.HOST || '0.0.0.0',
     nodeEnv: process.env.NODE_ENV || 'production',
     proxyApiKey: process.env.PROXY_API_KEY || null,
+    // JSON configuration source (null in legacy env-only mode).
+    configPath: null,
+    modelAliases: {},
+    modelGroups: {},
 
     maxRequestBodySize: intEnv('MAX_REQUEST_BODY_SIZE', 1024 * 1024),
     requestTimeoutMs: intEnv('REQUEST_TIMEOUT_MS', 60000),
@@ -95,6 +123,27 @@ export function loadConfig() {
   };
 
   const providers = [];
+
+  // ---- JSON file configuration (takes precedence over env providers) ------
+  const fileConfig = tryLoadFileConfig();
+  if (fileConfig) {
+    // Mark file mode BEFORE validation so provider-existence rules apply.
+    config.fileConfig = fileConfig;
+    config.configPath = fileConfig.configPath;
+    config.modelAliases = fileConfig.aliases;
+    config.modelGroups = fileConfig.groups;
+    // Provider objects are already internally shaped and frozen by the loader.
+    config.providers = fileConfig.providers.map(p => ({ ...p }));
+    // Server-level file settings; environment variables always win.
+    applyServerSettings(config, {});
+    validateConfig(config);
+    logger.info('Configuration loaded from file', {
+      providers: config.providers.map(p => p.name).join(','),
+      models: String(config.providers.reduce((s, p) => s + p.models.length, 0)),
+      maxAttempts: String(config.maxAttempts)
+    });
+    return config;
+  }
 
   /**
    * Per-provider capability overrides from env:
@@ -166,6 +215,18 @@ export function loadConfig() {
   return config;
 }
 
+/** File-level server settings (server: {...}); environment overrides each field. */
+function applyServerSettings(config) {
+  const pickInt = (envName, fileVal, def) =>
+    process.env[envName] !== undefined && process.env[envName] !== ''
+      ? intEnv(envName, def)
+      : (typeof fileVal === 'number' ? fileVal : def);
+  // (File-level server timing settings are validated by validateFileConfig;
+  //  environment variables always override, defaults applied otherwise.)
+  config.port = pickInt('PORT', config.port, config.port);
+  config.maxAttempts = pickInt('MAX_ATTEMPTS', config.maxAttempts, config.maxAttempts);
+}
+
 function validateConfig(config) {
   const errs = [];
 
@@ -209,8 +270,10 @@ function validateConfig(config) {
     }
   }
 
-  // Validate default provider exists.
-  if (config.providers.length > 0 && !config.providers.some(p => p.name === config.defaultProvider)) {
+  // Validate default provider exists (legacy env mode only; file-driven
+  // routing is registry-based and has no default-provider concept).
+  if (!config.fileConfig && config.providers.length > 0
+      && !config.providers.some(p => p.name === config.defaultProvider)) {
     errs.push(`DEFAULT_PROVIDER '${config.defaultProvider}' is not a configured provider`);
   }
 

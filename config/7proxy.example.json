@@ -1,0 +1,106 @@
+{
+  "providers": {
+    "datacenter1": {
+      "type": "openai-compatible",
+      "baseUrl": "https://datacenter1.example.invalid/v1",
+      "keys": [
+        { "env": "DATACENTER1_KEY_1" },
+        { "env": "DATACENTER1_KEY_2" }
+      ],
+      "capabilities": {
+        "chatCompletions": true,
+        "responses": "translated",
+        "anthropicMessages": "translated",
+        "anthropicTokenCount": "unsupported",
+        "tools": true,
+        "vision": false,
+        "reasoning": true
+      },
+      "models": [
+        "minimax-m3",
+        "glm-5.2",
+        "deepseek_v4_pro",
+        "deepseek-v4-flash",
+        "qwen3.8-27b-abliterated-nvfp4",
+        "hy3-heretic-bf16",
+        "kimi-k27-bf16",
+        "kimi-k2.7-code"
+      ]
+    },
+    "datacenter2": {
+      "type": "openai-compatible",
+      "baseUrl": "https://datacenter2.example.invalid",
+      "keys": [{ "env": "DATACENTER2_KEY_1" }],
+      "capabilities": {
+        "chatCompletions": true,
+        "responses": "unsupported",
+        "anthropicMessages": "unsupported",
+        "tools": true,
+        "vision": true
+      },
+      "models": [
+        "glm-5.2",
+        "deepseek-v4-flash"
+      ]
+    },
+    "anthropic-upstream": {
+      "type": "anthropic-compatible",
+      "baseUrl": "https://anthropic.example.invalid",
+      "keys": [{ "env": "ANTHROPIC_UPSTREAM_KEY" }],
+      "capabilities": {
+        "anthropicMessages": "native",
+        "anthropicTokenCount": "native",
+        "thinking": true,
+        "documents": true,
+        "betas": true,
+        "anthropicVersion": "2023-06-01"
+      },
+      "models": ["claude-sonnet-4"]
+    }
+  },
+  "models": {
+    "glm-5.2": {
+      "targets": [
+        { "provider": "datacenter1", "upstreamModel": "glm-5.2" }
+      ]
+    }
+  },
+  "aliases": {
+    "coding": "coding-smart",
+    "fast": "coding-fast",
+    "flagship-claude": "claude-sonnet-4"
+  },
+  "groups": {
+    "coding-smart": {
+      "strategy": "fallback",
+      "targets": [
+        { "provider": "datacenter1", "model": "glm-5.2" },
+        { "provider": "datacenter1", "model": "deepseek_v4_pro" },
+        { "provider": "datacenter1", "model": "kimi-k2.7-code" },
+        { "provider": "datacenter1", "model": "minimax-m3" }
+      ]
+    },
+    "coding-fast": {
+      "strategy": "round-robin",
+      "targets": [
+        { "provider": "datacenter1", "model": "deepseek-v4-flash" },
+        { "provider": "datacenter1", "model": "qwen3.8-27b-abliterated-nvfp4" }
+      ]
+    },
+    "balanced": {
+      "strategy": "weighted-random",
+      "targets": [
+        { "provider": "datacenter1", "model": "glm-5.2", "weight": 3 },
+        { "provider": "datacenter2", "model": "glm-5.2", "weight": 1 }
+      ]
+    }
+  },
+  "server": {
+    "requestTimeoutMs": 60000,
+    "streamTimeoutMs": 300000,
+    "maxAttempts": 4,
+    "retryBaseDelayMs": 250,
+    "retryMaxDelayMs": 4000,
+    "keyCooldownMs": 30000
+  }
+}

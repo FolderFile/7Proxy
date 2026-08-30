@@ -13,7 +13,7 @@ import { sendError, sendJson, readBody, sseHead } from '../core/http-utils.js';
 import { streamResponse } from '../core/streaming.js';
 
 export function createChatCompletionsHandler(ctx) {
-  const { config, registry, runWithFailover } = ctx;
+  const { config, registry, routingRegistry, runWithFailover } = ctx;
 
   /** POST /v1/chat/completions */
   async function handleChatCompletions(req, res, rid) {
@@ -44,20 +44,34 @@ export function createChatCompletionsHandler(ctx) {
       return;
     }
 
-    if (!registry.getByModel(model)) {
+    if (routingRegistry) {
+      if (!routingRegistry.has(model)) {
+        sendError(res, 404, Errors.notFound(`Model '${model}'`), { 'X-Request-Id': rid });
+        return;
+      }
+    } else if (!registry.getByModel(model)) {
       sendError(res, 404, Errors.notFound(`Model '${model}'`), { 'X-Request-Id': rid });
       return;
     }
 
-    logger.info('Chat request', { requestId: rid, model, provider: registry.getByModel(model).name,
-      stream: body.stream === true });
+    if (routingRegistry) {
+      logger.info('Chat request', { requestId: rid, model,
+        provider: routingRegistry.resolveAny(model)?.resolvedName ?? '',
+        stream: body.stream === true });
+    } else {
+      logger.info('Chat request', { requestId: rid, model, provider: registry.getByModel(model).name,
+        stream: body.stream === true });
+    }
 
     await runWithFailover({
       req, res, rid,
       api: 'chat',
       body,
-      // OpenAI-compatible pass-through: forward the client body unchanged.
-      prepareBody: (provider) => body,
+      // OpenAI-compatible pass-through: forward the client body unchanged,
+      // with the public model name rewritten to the target's upstream id on a
+      // fresh object (the client's request object is never mutated).
+      prepareBody: (provider, upstreamModel) =>
+        upstreamModel === body.model ? body : { ...body, model: upstreamModel },
       validateResult: null,
       commit: async ({ result, provider, clientCtrl, res, rid }) => {
         if (result.kind === 'json') {

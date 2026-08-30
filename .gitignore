@@ -51,3 +51,7 @@ benchmarks/results/
 *.cpuprofile
 *.heapprofile
 *.heapsnapshot
+
+# Real proxy configuration (may reference private infrastructure):
+# commit only config/7proxy.example.json; never the working config.
+config/7proxy.json

@@ -70,7 +70,10 @@ export function translateChatResponseToAnthropic(chatBody, anthropicRequest) {
     id: `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`,
     type: 'message',
     role: 'assistant',
-    model: chatBody?.model || anthropicRequest?.model || 'unknown',
+    // Report the PUBLIC requested model (anthropicRequest carries the
+    // rewritten upstream id, callers pass the public name separately when
+    // different). Falls back to what the upstream reported.
+    model: anthropicRequest?.publicModel || chatBody?.model || anthropicRequest?.model || 'unknown',
     content,
     stop_reason: mapFinishReasonToStopReason(choice?.finish_reason) ?? 'end_turn',
     stop_sequence: null,

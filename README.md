@@ -382,6 +382,114 @@ ALT_CAPABILITIES=responses=translated
 Requests route to the provider that can actually serve the requested fields;
 unsupported fields fail over to a capable provider or return a clear 400.
 
+## Model Routing (config file)
+
+Beyond the environment-only provider configuration, 7Proxy supports a small
+declarative JSON file for datacenter fleets: explicit models, aliases,
+routing groups and per-group strategies.
+
+- Default path: **`config/7proxy.json`** (never commit your real file; it is
+  git-ignored). Override with `SEVEN_PROXY_CONFIG=/path/to/config.json`.
+- Fully documented example: **`config/7proxy.example.json`** (safe example
+  URLs, environment-variable key references).
+
+### Schema overview
+
+```jsonc
+{
+  "providers": {
+    "datacenter1": {
+      "type": "openai-compatible",          // or "anthropic-compatible"
+      "baseUrl": "https://datacenter1.example.invalid/v1",
+      "keys": [ { "env": "DATACENTER1_KEY_1" } ],   // env references only
+      "capabilities": {
+        "chatCompletions": true,
+        "responses": "translated",          // native | translated | unsupported
+        "anthropicMessages": "translated",  // native | translated | unsupported
+        "anthropicTokenCount": "unsupported",
+        "tools": true, "vision": false, "reasoning": true
+      },
+      "models": ["minimax-m3", "glm-5.2", "deepseek_v4_pro", "deepseek-v4-flash",
+                 "qwen3.8-27b-abliterated-nvfp4", "hy3-heretic-bf16",
+                 "kimi-k27-bf16", "kimi-k2.7-code"]
+    }
+  },
+  "models":   { "glm-5.2": { "targets": [{ "provider": "datacenter1", "upstreamModel": "glm-5.2" }] } },
+  "aliases":  { "coding": "coding-smart", "fast": "coding-fast" },
+  "groups": {
+    "coding-smart": { "strategy": "fallback", "targets": [
+      { "provider": "datacenter1", "model": "glm-5.2" },
+      { "provider": "datacenter1", "model": "deepseek_v4_pro" }
+    ]}
+  },
+  "server": { "maxAttempts": 4, "requestTimeoutMs": 60000, "streamTimeoutMs": 300000,
+              "retryBaseDelayMs": 250, "retryMaxDelayMs": 4000, "keyCooldownMs": 30000 }
+}
+```
+
+- **`providers`**: `type` is `openai-compatible` or `anthropic-compatible`
+  (adapters own endpoint construction, auth shape and format selection).
+  Keys are ALWAYS `{ "env": "VAR_NAME" }` references - never inline secrets.
+- **`models`** (optional): pins a public name to concrete upstream ids
+  (`upstreamModel`), enabling per-provider model renaming.
+- **`aliases`**: `publicAlias -> model | other alias | group` (chains allowed,
+  cycles rejected). e.g. `coding` / `fast` above.
+- **`groups`**: routing groups with `fallback`, `round-robin`, `random` or
+  `weighted-random` strategies over provider-model targets (optional positive
+  `weight` for weighted-random).
+
+### Validation (fails fast at startup, names the config path, never values)
+
+Unknown provider types or capabilities; invalid/non-HTTPS base URLs (localhost
+relaxation needs `ALLOW_INSECURE_UPSTREAM=true`); providers without models or
+usable keys; missing referenced environment variables; unknown provider/model
+references; duplicate targets; alias cycles; group cycles; empty groups;
+invalid strategies/weights/timeouts; unsafe identifiers (`[A-Za-z0-9._:@~+/:-]`
+only); `__proto__`/`prototype`/`constructor` anywhere; ambiguous public names.
+Parsed configuration is deep-frozen; request handling cannot mutate it.
+Inline secrets in file configs are rejected — reference env vars only.
+
+### `GET /v1/models` & `/v1/models/:id`
+
+List/resolve **public names only** (direct models, aliases, groups) in
+OpenAI-compatible shape. Never exposed: provider ids, keys, env-var names,
+private base URLs, health state. Unknown ids return the same 404 shape as
+before.
+
+### Routing strategies
+
+- **fallback** (default): declared order; the global attempt budget
+  (`MAX_ATTEMPTS`, still authoritative) is never multiplied by group size.
+- **round-robin**: consecutive requests start on different targets
+  (concurrency-safe rotating cursor; configuration never mutated).
+- **random**: rotating-seed shuffle from the eligible set; retry plans never
+  duplicate a target.
+- **weighted-random**: positive finite weights pick the first target
+  (cumulative selection); remainder completes a duplicate-free plan.
+
+After the strategy orders targets, the shared loop still rotates keys within
+a target and enforces the global attempt budget, cooldowns and disables.
+
+### Capability-aware routing
+
+Targets that cannot serve a request's features are skipped BEFORE any upstream
+attempt (zero attempt cost): tool requests, vision parts, Responses
+`reasoning`, native-only Responses fields, Anthropic thinking/document blocks,
+and token counting (native-only). If no target qualifies, the protocol-native
+unsupported error is returned and nothing is attempted or degraded.
+
+### Model rewriting
+
+Client-visible model names stay public: the proxy rewrites `model` to the
+target's exact upstream id for Chat Completions, Responses (translated),
+`/v1/messages` (translated) and `/v1/messages/count_tokens` before the
+upstream call, on a fresh object (the client's request is never mutated).
+Translated responses report the public requested model; Anthropic-native
+passthrough forwards the same id verbatim (documented transparent relay).
+Errors never reveal internal upstream model names.
+
+## Adding New Providers
+
 ## Adding New Providers
 
 Create a provider configuration in `config.js`:

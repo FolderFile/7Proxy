@@ -1,24 +1,26 @@
 {
   "name": "seven-proxy",
-  "version": "0.3.0",
-  "description": "7Proxy - production-ready lightweight OpenAI-compatible AI proxy (Chat Completions + Responses APIs)",
+  "version": "0.4.0",
+  "description": "7Proxy - zero-dependency AI proxy (OpenAI Chat Completions + Responses, Anthropic Messages, configurable model routing with aliases and groups)",
   "main": "src/app.js",
   "type": "module",
   "scripts": {
     "start": "node src/app.js",
     "dev": "node --watch src/app.js",
-    "test": "node test/integration/chat-completions.test.js && node test/integration/responses.test.js && node test/integration/anthropic-messages.test.js"
+    "test": "node test/integration/chat-completions.test.js && node test/integration/responses.test.js && node test/integration/anthropic-messages.test.js && node test/integration/routing.test.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "keywords": [
     "openai",
+    "anthropic",
     "proxy",
     "ai",
     "llm",
     "streaming",
-    "responses-api"
+    "responses-api",
+    "model-routing"
   ],
   "license": "MIT"
 }
